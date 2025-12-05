@@ -1,9 +1,26 @@
 
+from typing import Sequence
 import numpy as np
 
 
-def gaussian(x, A, x0, sigma, offset):
+
+def gaussian(x: Sequence[float], A, x0, sigma, offset):
     """
     1D Gaussian with constant offset.
     """
-    return A * np.exp(-((x - x0) ** 2) / (2 * sigma ** 2)) + offset
+    xs = np.array(x, dtype=float)
+    
+    return A * np.exp(-((xs - x0) ** 2) / (2 * sigma ** 2)) + offset
+
+def usCFG_projection(
+    wavelengths: Sequence[float],
+    carrier_wavelength: float,
+    starting_wavelength: float,
+    bandwidth: float,
+    baseline: float,
+    phase: float,
+    acceleration: float) -> list[float]:
+    wavelengths_np = np.array(wavelengths, dtype=float)
+    sigma = bandwidth / np.sqrt(8*np.log(2))
+    # maybe not square gaussian
+    return baseline + (1-baseline) * (gaussian(wavelengths, 1, carrier_wavelength, sigma, 0) * np.sin(phase + acceleration * (wavelengths_np - starting_wavelength)**2))**2
