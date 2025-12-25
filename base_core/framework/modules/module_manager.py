@@ -1,80 +1,107 @@
-from dataclasses import dataclass
-from typing import Mapping, Sequence
+# base_lib/framework/modules/module_manager.py
+from __future__ import annotations
 
-from base_core.framework.app.context import AppContext
-from base_core.framework.di.container import Container
-from base_core.framework.modules.base_module import BaseModule
-from base_core.framework.modules.error import ModuleError
+from typing import Dict, Iterable, List, Type
+
+from base_core.framework.modules import ModuleError
+
+from .base_module import BaseModule
 
 
-@dataclass
+
 class ModuleManager:
-    """
-    - orders modules by `requires`
-    - calls register() for all
-    - then start() for all
-    - hooks stop() into ctx.lifecycle (reverse order)
-    """
-    modules: Sequence[BaseModule]
+    def __init__(self, modules: Iterable[BaseModule]) -> None:
+        self._modules: List[BaseModule] = list(modules)
+        self._by_type: Dict[Type[BaseModule], BaseModule] = {}
 
-    def _index(self) -> Mapping[str, BaseModule]:
-        by_name: dict[str, BaseModule] = {}
-        for m in self.modules:
-            if m.name in by_name:
-                raise ModuleError(f"Duplicate module name: {m.name!r}")
-            by_name[m.name] = m
-        return by_name
+        # Ensure one instance per module class
+        for m in self._modules:
+            t = type(m)
+            if t in self._by_type:
+                raise ModuleError(
+                    f"Duplicate module instance for type {t.__name__}. "
+                    f"Provide only one instance per module class."
+                )
+            self._by_type[t] = m
 
-    def _order(self) -> list[BaseModule]:
-        by_name = self._index()
+        self._sorted: List[BaseModule] = []
 
-        for m in self.modules:
-            for dep in m.requires:
-                if dep not in by_name:
-                    raise ModuleError(f"Module {m.name!r} requires missing module {dep!r}")
+    # ---------- public API ----------
 
-        incoming: dict[str, int] = {m.name: 0 for m in self.modules}
-        outgoing: dict[str, list[str]] = {m.name: [] for m in self.modules}
+    def bootstrap(self, c, ctx) -> None:
+        """
+        Boot sequence:
+        1) topologically sort modules by requires
+        2) call register() in order
+        3) call on_startup() in order
+        """
+        self._sorted = self._toposort()
 
-        for m in self.modules:
-            for dep in m.requires:
-                incoming[m.name] += 1
-                outgoing[dep].append(m.name)
-
-        queue = [name for name, n in incoming.items() if n == 0]
-        ordered_names: list[str] = []
-
-        while queue:
-            n = queue.pop()
-            ordered_names.append(n)
-            for nxt in outgoing[n]:
-                incoming[nxt] -= 1
-                if incoming[nxt] == 0:
-                    queue.append(nxt)
-
-        if len(ordered_names) != len(self.modules):
-            remaining = [name for name, n in incoming.items() if n > 0]
-            raise ModuleError(f"Dependency cycle among: {remaining}")
-
-        return [by_name[name] for name in ordered_names]
-
-    def bootstrap(self, c: Container, ctx: AppContext) -> None:
-        ordered = self._order()
-
-        for m in ordered:
-            ctx.log.info("Registering module: %s", m.name)
+        for m in self._sorted:
             m.register(c, ctx)
 
-        for m in ordered:
-            ctx.log.info("Starting module: %s", m.name)
-            m.start(c, ctx)
+        for m in self._sorted:
+            m.on_startup(c, ctx)
 
-        def _shutdown() -> None:
-            for m in reversed(ordered):
-                try:
-                    ctx.log.info("Stopping module: %s", m.name)
-                    m.stop(c, ctx)
-                except Exception:
-                    ctx.log.exception("Error stopping module: %s", m.name)
+    def shutdown(self, c, ctx) -> None:
+        """
+        Shutdown in reverse order.
+        Safe to call even if bootstrap wasn't called (no-op).
+        """
+        if not self._sorted:
+            return
 
-        ctx.lifecycle.add_shutdown_hook(_shutdown)
+        for m in reversed(self._sorted):
+            try:
+                m.on_shutdown(c, ctx)
+            except Exception:
+                # Never crash shutdown; log if available
+                if hasattr(ctx, "log"):
+                    ctx.log.exception("Error while shutting down module %s", self._mod_label(m))
+
+    # ---------- internals ----------
+
+    def _toposort(self) -> List[BaseModule]:
+        """
+        DFS topological sort with cycle detection.
+        """
+        UNVISITED, VISITING, VISITED = 0, 1, 2
+        state: Dict[Type[BaseModule], int] = {}
+        stack: List[Type[BaseModule]] = []
+        out: List[BaseModule] = []
+
+        def visit(t: Type[BaseModule]) -> None:
+            st = state.get(t, UNVISITED)
+            if st == VISITING:
+                # cycle -> show nice chain
+                cycle = " -> ".join([x.__name__ for x in stack + [t]])
+                raise ModuleError(f"Module dependency cycle detected: {cycle}")
+            if st == VISITED:
+                return
+
+            mod = self._by_type.get(t)
+            if mod is None:
+                raise ModuleError(
+                    f"Missing required module: {t.__name__}. "
+                    f"Add an instance of {t.__name__} to ModuleManager(modules=[...])."
+                )
+
+            state[t] = VISITING
+            stack.append(t)
+
+            for dep_t in getattr(mod, "requires", ()):
+                visit(dep_t)
+
+            stack.pop()
+            state[t] = VISITED
+            out.append(mod)
+
+        # Visit in the order the user provided (stable-ish)
+        for m in self._modules:
+            visit(type(m))
+
+        # out already in dependency-first order (because DFS appends after deps)
+        return out
+
+    def _mod_label(self, m: BaseModule) -> str:
+        return m.name or type(m).__name__

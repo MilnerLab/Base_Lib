@@ -19,14 +19,10 @@ class AppContext:
     - config: runtime configuration/settings
     - log: application logger
     - events: pub/sub event bus
-    - executor: background thread pool for blocking work
     - lifecycle: shutdown hooks
-    - ui: UI dispatcher adapter (set by GUI app)
     """
 
     config: dict
     log: logging.Logger
     events: EventBus
-    executor: ThreadPoolExecutor
     lifecycle: Lifecycle
-    ui: Optional[UiDispatcher] = None

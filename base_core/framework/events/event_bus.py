@@ -9,13 +9,6 @@ Handler = Callable[[Any], None]
 
 @dataclass
 class EventBus:
-    """
-    Thread-safe pub/sub event bus.
-
-    Note: handlers are called in the publishing thread.
-    For UI updates, use ctx.ui.post(...) inside the handler.
-    """
-
     def __post_init__(self) -> None:
         self._lock = threading.RLock()
         self._subs: Dict[str, List[Handler]] = {}
@@ -36,4 +29,7 @@ class EventBus:
         with self._lock:
             handlers = list(self._subs.get(topic, []))
         for h in handlers:
-            h(payload)
+            try:
+                h(payload)
+            except Exception:
+                pass

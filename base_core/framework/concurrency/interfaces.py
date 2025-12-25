@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
-from typing import Callable, Hashable, Optional, Protocol, TypeVar
+import threading
+from typing import Callable, Hashable, Iterable, Optional, Protocol, TypeVar
+
+from base_core.framework.concurrency.task_runner import StreamHandle
 
 T = TypeVar("T")
 
@@ -9,11 +12,11 @@ T = TypeVar("T")
 
 class ITaskRunner(Protocol):
     """
-    Runs functions in background and executes callbacks (optionally) on the UI thread.
+    Qt-free concurrency interface.
 
-    Cancel semantics:
-    - Future.cancel() only works if the task has not started yet.
-    - For running tasks, use drop_outdated=True to ignore stale results.
+    Threading note:
+    - Callbacks are invoked from worker threads.
+      In Qt apps: emit signals; don't touch widgets.
     """
 
     def run(
@@ -26,6 +29,19 @@ class ITaskRunner(Protocol):
         cancel_previous: bool = False,
         drop_outdated: bool = True,
     ) -> Future[T]:
+        ...
+
+    def stream(
+        self,
+        producer: Callable[[threading.Event], Iterable[T]],
+        *,
+        on_item: Callable[[T], None],
+        on_error: Optional[Callable[[BaseException], None]] = None,
+        on_complete: Optional[Callable[[], None]] = None,
+        key: Hashable | None = None,
+        cancel_previous: bool = False,
+        drop_outdated: bool = True,
+    ) -> StreamHandle:
         ...
 
     def cancel(self, key: Hashable) -> bool:

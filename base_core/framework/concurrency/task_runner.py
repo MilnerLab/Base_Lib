@@ -1,3 +1,4 @@
+# base_lib/framework/concurrency/task_runner.py
 from __future__ import annotations
 
 import threading
@@ -6,7 +7,6 @@ from typing import Callable, Hashable, Iterable, Optional
 
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from base_core.framework.app.dispatcher import UiPost
 from base_core.framework.concurrency.interfaces import T, ITaskRunner
 
 
@@ -28,33 +28,28 @@ class StreamHandle:
 
 class TaskRunner(ITaskRunner):
     """
-    One place for background execution:
+    One place for background execution (Qt-free):
     - run(): one-shot (exactly one result)
-    - stream(): producer yields many items (UI gets always the latest item)
+    - stream(): producer yields many items
     - key/cancel_previous/drop_outdated: "latest wins" semantics
-    - ui_post: ensures callbacks run on UI thread if provided
+
+    Threading note:
+    - on_success/on_error/on_item/on_complete are called from worker threads.
+      In Qt apps: emit signals there; don't touch widgets.
     """
 
-    def __init__(self, executor: ThreadPoolExecutor, *, ui_post: UiPost | None = None) -> None:
+    def __init__(self, executor: ThreadPoolExecutor) -> None:
         self._executor = executor
-        self._ui_post = ui_post
         self._lock = threading.RLock()
         self._entries: dict[Hashable, _Entry] = {}
 
     # ----------------- internal helpers -----------------
-
-    def _dispatch(self, cb: Callable[[], None]) -> None:
-        if self._ui_post is None:
-            cb()
-        else:
-            self._ui_post(cb)
 
     def _next_token_and_cancel_prev(
         self,
         key: Hashable | None,
         *,
         cancel_previous: bool,
-        new_stop_event: Optional[threading.Event],
     ) -> int:
         if key is None:
             return 0
@@ -71,10 +66,16 @@ class TaskRunner(ITaskRunner):
             if prev.stop_event is not None:
                 prev.stop_event.set()
 
-        # We don't set the new entry here; done after submit.
         return token
 
-    def _set_entry(self, key: Hashable | None, token: int, future: Future, stop_event: Optional[threading.Event]) -> None:
+    def _set_entry(
+        self,
+        key: Hashable | None,
+        token: int,
+        future: Future,
+        *,
+        stop_event: Optional[threading.Event],
+    ) -> None:
         if key is None:
             return
         self._entries[key] = _Entry(token=token, future=future, stop_event=stop_event)
@@ -98,11 +99,7 @@ class TaskRunner(ITaskRunner):
         drop_outdated: bool = True,
     ) -> Future[T]:
         with self._lock:
-            token = self._next_token_and_cancel_prev(
-                key,
-                cancel_previous=cancel_previous,
-                new_stop_event=None,
-            )
+            token = self._next_token_and_cancel_prev(key, cancel_previous=cancel_previous)
 
         fut: Future[T] = self._executor.submit(fn)
 
@@ -118,11 +115,11 @@ class TaskRunner(ITaskRunner):
                 res = f.result()
             except BaseException as e:
                 if on_error is not None:
-                    self._dispatch(lambda: on_error(e))
+                    on_error(e)
                 return
 
             if on_success is not None:
-                self._dispatch(lambda: on_success(res))
+                on_success(res)
 
         fut.add_done_callback(_done)
         return fut
@@ -141,45 +138,7 @@ class TaskRunner(ITaskRunner):
         stop_event = threading.Event()
 
         with self._lock:
-            token = self._next_token_and_cancel_prev(
-                key,
-                cancel_previous=cancel_previous,
-                new_stop_event=stop_event,
-            )
-
-        # "latest-only" delivery: UI never gets a backlog, only the newest item.
-        latest_lock = threading.Lock()
-        latest: Optional[T] = None
-        scheduled = False
-
-        def schedule_flush() -> None:
-            nonlocal scheduled
-
-            def flush() -> None:
-                nonlocal scheduled
-                # If stream is outdated, ignore UI updates.
-                with self._lock:
-                    if not self._is_latest(key, token, drop_outdated=drop_outdated):
-                        scheduled = False
-                        return
-
-                with latest_lock:
-                    value = latest
-                    scheduled = False
-
-                if value is not None:
-                    on_item(value)
-
-            self._dispatch(flush)
-
-        def publish(item: T) -> None:
-            nonlocal latest, scheduled
-            with latest_lock:
-                latest = item
-                if scheduled:
-                    return
-                scheduled = True
-            schedule_flush()
+            token = self._next_token_and_cancel_prev(key, cancel_previous=cancel_previous)
 
         def loop() -> None:
             try:
@@ -189,13 +148,13 @@ class TaskRunner(ITaskRunner):
                     with self._lock:
                         if not self._is_latest(key, token, drop_outdated=drop_outdated):
                             break
-                    publish(item)
+                    on_item(item)
             except BaseException as e:
                 if on_error is not None:
-                    self._dispatch(lambda: on_error(e))
+                    on_error(e)
             finally:
                 if on_complete is not None:
-                    self._dispatch(on_complete)
+                    on_complete()
 
         fut: Future[None] = self._executor.submit(loop)
 
