@@ -1,5 +1,6 @@
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
+@runtime_checkable
 class IRunnable(Protocol):
     def start(self) -> None: ...
     def stop(self) -> None: ...
