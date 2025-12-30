@@ -1,25 +1,23 @@
 from __future__ import annotations
 
-from concurrent.futures import Future
 import threading
+from dataclasses import dataclass
 from typing import Callable, Hashable, Iterable, Optional, Protocol, TypeVar
-
-from base_core.framework.concurrency.models import StreamHandle
-
+from concurrent.futures import Future
 
 T = TypeVar("T")
 
 
+@dataclass(frozen=True)
+class StreamHandle:
+    stop_event: threading.Event
+    future: Future[None]
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
 
 class ITaskRunner(Protocol):
-    """
-    Qt-free concurrency interface.
-
-    Threading note:
-    - Callbacks are invoked from worker threads.
-      In Qt apps: emit signals; don't touch widgets.
-    """
-
     def run(
         self,
         fn: Callable[[], T],
@@ -45,8 +43,5 @@ class ITaskRunner(Protocol):
     ) -> StreamHandle:
         ...
 
-    def cancel(self, key: Hashable) -> bool:
-        ...
-
-    def cancel_all(self) -> None:
-        ...
+    def cancel(self, key: Hashable) -> bool: ...
+    def cancel_all(self) -> None: ...

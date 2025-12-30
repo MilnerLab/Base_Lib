@@ -1,14 +1,12 @@
-# base_lib/framework/concurrency/task_runner.py
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
 from typing import Callable, Hashable, Iterable, Optional
-
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from base_core.framework.concurrency.models import StreamHandle
-from base_core.framework.concurrency.interfaces import T, ITaskRunner
+from .interfaces import T, ITaskRunner, StreamHandle
+
 
 @dataclass
 class _Entry:
@@ -19,14 +17,10 @@ class _Entry:
 
 class TaskRunner(ITaskRunner):
     """
-    One place for background execution (Qt-free):
-    - run(): one-shot (exactly one result)
-    - stream(): producer yields many items
+    Background execution helper:
+    - run(): one-shot
+    - stream(): producer yields many items (delivers only the latest)
     - key/cancel_previous/drop_outdated: "latest wins" semantics
-
-    Threading note:
-    - on_success/on_error/on_item/on_complete are called from worker threads.
-      In Qt apps: emit signals there; don't touch widgets.
     """
 
     def __init__(self, executor: ThreadPoolExecutor) -> None:
@@ -34,13 +28,12 @@ class TaskRunner(ITaskRunner):
         self._lock = threading.RLock()
         self._entries: dict[Hashable, _Entry] = {}
 
-    # ----------------- internal helpers -----------------
-
     def _next_token_and_cancel_prev(
         self,
         key: Hashable | None,
         *,
         cancel_previous: bool,
+        new_stop_event: Optional[threading.Event],
     ) -> int:
         if key is None:
             return 0
@@ -52,7 +45,6 @@ class TaskRunner(ITaskRunner):
         token = prev.token + 1
 
         if cancel_previous:
-            # Best-effort cancel (only works if not started) + cooperative stop for streams
             prev.future.cancel()
             if prev.stop_event is not None:
                 prev.stop_event.set()
@@ -64,7 +56,6 @@ class TaskRunner(ITaskRunner):
         key: Hashable | None,
         token: int,
         future: Future,
-        *,
         stop_event: Optional[threading.Event],
     ) -> None:
         if key is None:
@@ -77,8 +68,6 @@ class TaskRunner(ITaskRunner):
         cur = self._entries.get(key)
         return cur is not None and cur.token == token
 
-    # ----------------- public API -----------------
-
     def run(
         self,
         fn: Callable[[], T],
@@ -90,25 +79,28 @@ class TaskRunner(ITaskRunner):
         drop_outdated: bool = True,
     ) -> Future[T]:
         with self._lock:
-            token = self._next_token_and_cancel_prev(key, cancel_previous=cancel_previous)
+            token = self._next_token_and_cancel_prev(
+                key, cancel_previous=cancel_previous, new_stop_event=None
+            )
 
         fut: Future[T] = self._executor.submit(fn)
 
         with self._lock:
             self._set_entry(key, token, fut, stop_event=None)
 
+        if on_success is None and on_error is None:
+            return fut
+
         def _done(f: Future[T]) -> None:
             with self._lock:
                 if not self._is_latest(key, token, drop_outdated=drop_outdated):
                     return
-
             try:
                 res = f.result()
             except BaseException as e:
                 if on_error is not None:
                     on_error(e)
                 return
-
             if on_success is not None:
                 on_success(res)
 
@@ -129,7 +121,34 @@ class TaskRunner(ITaskRunner):
         stop_event = threading.Event()
 
         with self._lock:
-            token = self._next_token_and_cancel_prev(key, cancel_previous=cancel_previous)
+            token = self._next_token_and_cancel_prev(
+                key, cancel_previous=cancel_previous, new_stop_event=stop_event
+            )
+
+        latest_lock = threading.Lock()
+        latest: Optional[T] = None
+        scheduled = False
+
+        def flush_latest() -> None:
+            nonlocal scheduled
+            with self._lock:
+                if not self._is_latest(key, token, drop_outdated=drop_outdated):
+                    scheduled = False
+                    return
+            with latest_lock:
+                value = latest
+                scheduled = False
+            if value is not None:
+                on_item(value)
+
+        def publish(item: T) -> None:
+            nonlocal latest, scheduled
+            with latest_lock:
+                latest = item
+                if scheduled:
+                    return
+                scheduled = True
+            flush_latest()
 
         def loop() -> None:
             try:
@@ -139,7 +158,7 @@ class TaskRunner(ITaskRunner):
                     with self._lock:
                         if not self._is_latest(key, token, drop_outdated=drop_outdated):
                             break
-                    on_item(item)
+                    publish(item)
             except BaseException as e:
                 if on_error is not None:
                     on_error(e)
