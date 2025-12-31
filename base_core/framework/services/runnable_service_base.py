@@ -22,6 +22,6 @@ class RunnableServiceBase(IRunnable):
         self._state = ServiceState.STOPPED
 
     def reset(self) -> None:
-        if not self.is_running:
-            return
+        if self.is_running:
+            self.stop()
         self._state = ServiceState.NEW
