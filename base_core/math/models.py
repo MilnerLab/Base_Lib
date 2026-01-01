@@ -7,9 +7,10 @@ from base_core.math.enums import AngleUnit
 
 
 class Angle(float):
-    def __new__(cls, value: float, unit: AngleUnit = AngleUnit.RAD):
+    def __new__(cls, value: float, unit: AngleUnit = AngleUnit.RAD, wrap: bool = True):
         radians = float(value) * unit.value
-        radians = cls._wrap_to_minus_pi_pi(radians)
+        if wrap:
+            radians = cls._wrap_to_minus_pi_pi(radians)
         return super().__new__(cls, radians)
 
     @staticmethod
